@@ -6,7 +6,7 @@ import {
   handleAdminVerify,
   handleGenerateProject,
   handleRefineProject,
-} from './api/_lib/geminiBackend';
+} from './api/_lib/geminiBackend.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isProduction = process.env.NODE_ENV === 'production';

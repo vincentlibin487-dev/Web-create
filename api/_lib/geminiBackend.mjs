@@ -1,16 +1,11 @@
 import crypto from 'crypto';
 import { GoogleGenAI, Type } from '@google/genai';
 
-export interface ProjectFile {
-  path: string;
-  content: string;
-}
-
-const FREE_TIER_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
+const FREE_TIER_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
 const ADMIN_PASSCODE_HASH = 'd6cfc211cfcbe6da718b48a62b60450f81651c633df4c4dbf3c10755ef09f082';
-const slotCooldowns = new Map<string, number>();
+const slotCooldowns = new Map();
 
-export function getServerGeminiKeyPool(): string[] {
+export function getServerGeminiKeyPool() {
   const candidates = [
     process.env.GEMINI_API_KEY || '',
     ...(process.env.GEMINI_API_KEYS || '').split(','),
@@ -26,7 +21,7 @@ export function getServerGeminiKeyPool(): string[] {
   return Array.from(new Set(candidates));
 }
 
-export function isRetryableQuotaOrServerError(err: any): boolean {
+export function isRetryableQuotaOrServerError(err) {
   const status = err?.status || err?.code;
   const msg = String(err?.message || err || '').toLowerCase();
   return (
@@ -43,22 +38,18 @@ export function isRetryableQuotaOrServerError(err: any): boolean {
   );
 }
 
-async function sleep(ms: number) {
+function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function executeGeminiWithFallback(params: {
-  preferredModel?: string;
-  contents: any;
-  config: any;
-}) {
+export async function executeGeminiWithFallback(params) {
   const keyPool = getServerGeminiKeyPool();
   if (keyPool.length === 0) {
-    throw new Error('GEMINI_API_KEY is not configured. Please set GEMINI_API_KEY in Environment Variables / Secrets.');
+    throw new Error('GEMINI_API_KEY is not configured. Please add GEMINI_API_KEY in Vercel Environment Variables (or Secrets) and redeploy.');
   }
 
-  const normalizedPref = FREE_TIER_MODELS.includes(params.preferredModel as any)
-    ? (params.preferredModel as string)
+  const normalizedPref = FREE_TIER_MODELS.includes(params.preferredModel)
+    ? params.preferredModel
     : FREE_TIER_MODELS[0];
 
   const modelQueue = [
@@ -67,7 +58,7 @@ export async function executeGeminiWithFallback(params: {
   ];
 
   const now = Date.now();
-  const attempts: { keyIndex: number; model: string }[] = [];
+  const attempts = [];
 
   for (const model of modelQueue) {
     for (let keyIndex = 0; keyIndex < keyPool.length; keyIndex++) {
@@ -88,7 +79,7 @@ export async function executeGeminiWithFallback(params: {
     }
   }
 
-  let lastError: any = null;
+  let lastError = null;
   for (let i = 0; i < attempts.length; i++) {
     const { keyIndex, model } = attempts[i];
     const apiKey = keyPool[keyIndex];
@@ -115,7 +106,7 @@ export async function executeGeminiWithFallback(params: {
         totalKeySlots: keyPool.length,
         fallbackUsed: i > 0,
       };
-    } catch (err: any) {
+    } catch (err) {
       lastError = err;
       if (isRetryableQuotaOrServerError(err)) {
         slotCooldowns.set(`${keyIndex}:${model}`, Date.now() + 60_000);
@@ -131,7 +122,7 @@ export async function executeGeminiWithFallback(params: {
   throw lastError || new Error('All Gemini models and API key slots are currently busy.');
 }
 
-function extractBalancedJsonObject(text: string): string | null {
+function extractBalancedJsonObject(text) {
   const startIdx = text.indexOf('{');
   if (startIdx === -1) return null;
 
@@ -167,7 +158,7 @@ function extractBalancedJsonObject(text: string): string | null {
   return null;
 }
 
-export function cleanAndParseGeminiJson<T = Record<string, any>>(rawText: string): T {
+export function cleanAndParseGeminiJson(rawText) {
   const trimmed = String(rawText || '')
     .replace(/^\uFEFF/, '')
     .trim();
@@ -176,10 +167,10 @@ export function cleanAndParseGeminiJson<T = Record<string, any>>(rawText: string
     throw new Error('Gemini returned an empty response.');
   }
 
-  const candidates: string[] = [trimmed];
+  const candidates = [trimmed];
 
   const fenceRegex = /```(?:json|JSON)?\s*([\s\S]*?)```/g;
-  let match: RegExpExecArray | null;
+  let match;
   while ((match = fenceRegex.exec(trimmed)) !== null) {
     if (match[1]?.trim()) {
       candidates.push(match[1].trim());
@@ -194,7 +185,7 @@ export function cleanAndParseGeminiJson<T = Record<string, any>>(rawText: string
     candidates.push(strippedFence);
   }
 
-  const expandedCandidates: string[] = [];
+  const expandedCandidates = [];
   for (const cand of candidates) {
     expandedCandidates.push(cand);
     const balanced = extractBalancedJsonObject(cand);
@@ -211,12 +202,12 @@ export function cleanAndParseGeminiJson<T = Record<string, any>>(rawText: string
     }
   }
 
-  let lastParseError: unknown = null;
+  let lastParseError = null;
   for (const candidate of expandedCandidates) {
     try {
       const parsed = JSON.parse(candidate);
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return parsed as T;
+        return parsed;
       }
     } catch (err) {
       lastParseError = err;
@@ -224,26 +215,59 @@ export function cleanAndParseGeminiJson<T = Record<string, any>>(rawText: string
   }
 
   const errMsg = lastParseError instanceof Error ? lastParseError.message : 'Invalid JSON structure';
-  const parseErr: any = new Error(`AI returned an invalid JSON response (${errMsg}). Please try again.`);
+  const parseErr = new Error(`AI returned an invalid JSON response (${errMsg}). Please try again.`);
   parseErr.code = 'INVALID_JSON_RESPONSE';
   throw parseErr;
 }
 
-export function parseBodySafely(body: any): Record<string, any> {
-  if (!body) return {};
-  if (typeof body === 'string') {
+export async function parseRequestBody(req) {
+  const existingBody = req?.body;
+  if (existingBody && typeof existingBody === 'object' && !Buffer.isBuffer(existingBody)) {
+    return existingBody;
+  }
+  if (typeof existingBody === 'string') {
     try {
-      return JSON.parse(body);
+      return JSON.parse(existingBody);
     } catch {
       return {};
     }
   }
-  return typeof body === 'object' ? body : {};
+  if (Buffer.isBuffer(existingBody)) {
+    try {
+      return JSON.parse(existingBody.toString('utf8'));
+    } catch {
+      return {};
+    }
+  }
+  if (req && typeof req.on === 'function' && !req.readableEnded) {
+    try {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+      }
+      const raw = Buffer.concat(chunks).toString('utf8').trim();
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
 }
 
-export function handleAdminVerify(bodyInput: any): { status: number; payload: Record<string, any> } {
+export function sendJson(res, status, payload) {
+  if (typeof res.status === 'function' && typeof res.json === 'function') {
+    return res.status(status).json(payload);
+  }
+  res.statusCode = status;
+  if (typeof res.setHeader === 'function') {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  }
+  res.end(JSON.stringify(payload));
+}
+
+export function handleAdminVerify(bodyInput) {
   try {
-    const body = parseBodySafely(bodyInput);
+    const body = bodyInput && typeof bodyInput === 'object' ? bodyInput : {};
     const password = typeof body.password === 'string' ? body.password : '';
     if (!password) {
       return { status: 400, payload: { ok: false, error: 'Password is required' } };
@@ -269,9 +293,9 @@ export function handleAdminVerify(bodyInput: any): { status: number; payload: Re
   }
 }
 
-export async function handleGenerateProject(bodyInput: any): Promise<{ status: number; payload: Record<string, any> }> {
+export async function handleGenerateProject(bodyInput) {
   try {
-    const body = parseBodySafely(bodyInput);
+    const body = bodyInput && typeof bodyInput === 'object' ? bodyInput : {};
     const { prompt, attachment, projectName, preferredModel } = body;
     if (!prompt) {
       return { status: 400, payload: { error: 'Prompt is required' } };
@@ -281,7 +305,7 @@ export async function handleGenerateProject(bodyInput: any): Promise<{ status: n
       return {
         status: 500,
         payload: {
-          error: 'GEMINI_API_KEY is not configured. Please add GEMINI_API_KEY in Environment Variables / Secrets.',
+          error: 'GEMINI_API_KEY is not configured. Please add GEMINI_API_KEY in Vercel Environment Variables / Secrets.',
         },
       };
     }
@@ -291,7 +315,7 @@ export async function handleGenerateProject(bodyInput: any): Promise<{ status: n
       : '';
 
     const promptText = `Create a complete multi-file web project for this idea: ${prompt}.${nameDirective}`;
-    let contents: any = promptText;
+    let contents = promptText;
     if (attachment) {
       contents = {
         parts: [
@@ -360,14 +384,14 @@ CRITICAL: Every generated index.html and fullCode MUST include <meta name="viewp
       throw new Error('No response generated from Gemini AI.');
     }
 
-    const data = cleanAndParseGeminiJson<Record<string, any>>(responseText);
+    const data = cleanAndParseGeminiJson(responseText);
     if (!Array.isArray(data.files) || data.files.length === 0) {
       if (typeof data.fullCode === 'string' && data.fullCode.trim()) {
         data.files = [{ path: 'index.html', content: data.fullCode }];
       } else {
-        throw Object.assign(new Error('AI response is missing generated project files. Please try again.'), {
-          code: 'INVALID_JSON_RESPONSE',
-        });
+        const err = new Error('AI response is missing generated project files. Please try again.');
+        err.code = 'INVALID_JSON_RESPONSE';
+        throw err;
       }
     }
     if (projectName?.trim()) {
@@ -376,23 +400,23 @@ CRITICAL: Every generated index.html and fullCode MUST include <meta name="viewp
     data.usedModel = usedModel;
     data.fallbackUsed = fallbackUsed;
     return { status: 200, payload: data };
-  } catch (error: any) {
+  } catch (error) {
     console.error('Generation error:', error);
     const isQuota = isRetryableQuotaOrServerError(error);
     const isParseError = error?.code === 'INVALID_JSON_RESPONSE';
     return {
       status: isQuota ? 429 : isParseError ? 502 : 500,
       payload: {
-        error: error.message || 'Failed to generate project',
+        error: error?.message || 'Failed to generate project',
         code: isQuota ? 'RATE_LIMITED' : isParseError ? 'INVALID_JSON_RESPONSE' : 'GENERATION_ERROR',
       },
     };
   }
 }
 
-export async function handleRefineProject(bodyInput: any): Promise<{ status: number; payload: Record<string, any> }> {
+export async function handleRefineProject(bodyInput) {
   try {
-    const body = parseBodySafely(bodyInput);
+    const body = bodyInput && typeof bodyInput === 'object' ? bodyInput : {};
     const { prompt, attachment, currentFiles, projectTitle, preferredModel } = body;
     if (!prompt || !currentFiles) {
       return { status: 400, payload: { error: 'Prompt and currentFiles are required' } };
@@ -402,12 +426,12 @@ export async function handleRefineProject(bodyInput: any): Promise<{ status: num
       return { status: 500, payload: { error: 'GEMINI_API_KEY is not configured.' } };
     }
 
-    const filesSummary = (currentFiles as ProjectFile[])
+    const filesSummary = (Array.isArray(currentFiles) ? currentFiles : [])
       .map((f) => `=== FILE: ${f.path} ===\n${f.content}`)
       .join('\n\n');
 
     const promptText = `Refine and edit this project according to this instruction: ${prompt}`;
-    let contents: any = promptText;
+    let contents = promptText;
     if (attachment) {
       contents = {
         parts: [
@@ -477,7 +501,7 @@ CRITICAL INSTRUCTIONS:
       throw new Error('No response generated from Gemini AI.');
     }
 
-    const data = cleanAndParseGeminiJson<Record<string, any>>(responseText);
+    const data = cleanAndParseGeminiJson(responseText);
     if (!Array.isArray(data.files) || data.files.length === 0) {
       data.files = currentFiles;
     }
@@ -487,14 +511,14 @@ CRITICAL INSTRUCTIONS:
     data.usedModel = usedModel;
     data.fallbackUsed = fallbackUsed;
     return { status: 200, payload: data };
-  } catch (error: any) {
+  } catch (error) {
     console.error('Refinement error:', error);
     const isQuota = isRetryableQuotaOrServerError(error);
     const isParseError = error?.code === 'INVALID_JSON_RESPONSE';
     return {
       status: isQuota ? 429 : isParseError ? 502 : 500,
       payload: {
-        error: error.message || 'Failed to refine project',
+        error: error?.message || 'Failed to refine project',
         code: isQuota ? 'RATE_LIMITED' : isParseError ? 'INVALID_JSON_RESPONSE' : 'REFINEMENT_ERROR',
       },
     };
