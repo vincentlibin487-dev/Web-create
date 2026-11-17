@@ -8,6 +8,9 @@ const slotCooldowns = new Map();
 export function getServerGeminiKeyPool() {
   const candidates = [
     process.env.GEMINI_API_KEY || '',
+    process.env.GOOGLE_API_KEY || '',
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY || '',
+    process.env.API_KEY || '',
     ...(process.env.GEMINI_API_KEYS || '').split(','),
     process.env.GEMINI_API_KEY_2 || '',
     process.env.GEMINI_API_KEY_3 || '',
@@ -38,14 +41,138 @@ export function isRetryableQuotaOrServerError(err) {
   );
 }
 
+function isFallbackEligibleError(err) {
+  if (isRetryableQuotaOrServerError(err)) return true;
+  const status = err?.status || err?.code;
+  const msg = String(err?.message || err || '').toLowerCase();
+  return (
+    status === 404 ||
+    status === 'INVALID_JSON_RESPONSE' ||
+    msg.includes('not found') ||
+    msg.includes('not_found') ||
+    msg.includes('invalid json') ||
+    msg.includes('empty response')
+  );
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractBalancedJsonObject(text) {
+  const startIdx = text.indexOf('{');
+  if (startIdx === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          return text.slice(startIdx, i + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function cleanAndParseGeminiJson(rawText) {
+  const trimmed = String(rawText || '')
+    .replace(/^\uFEFF/, '')
+    .trim();
+
+  if (!trimmed) {
+    const emptyErr = new Error('Gemini returned an empty response.');
+    emptyErr.code = 'INVALID_JSON_RESPONSE';
+    throw emptyErr;
+  }
+
+  const candidates = [trimmed];
+
+  const fenceRegex = /```(?:json|JSON)?\s*([\s\S]*?)```/g;
+  let match;
+  while ((match = fenceRegex.exec(trimmed)) !== null) {
+    if (match[1]?.trim()) {
+      candidates.push(match[1].trim());
+    }
+  }
+
+  const strippedFence = trimmed
+    .replace(/^```(?:json|JSON)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  if (strippedFence && strippedFence !== trimmed) {
+    candidates.push(strippedFence);
+  }
+
+  const expandedCandidates = [];
+  for (const cand of candidates) {
+    expandedCandidates.push(cand);
+    const balanced = extractBalancedJsonObject(cand);
+    if (balanced && balanced !== cand) {
+      expandedCandidates.push(balanced);
+    }
+    const firstBrace = cand.indexOf('{');
+    const lastBrace = cand.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      const sliced = cand.slice(firstBrace, lastBrace + 1);
+      if (sliced !== cand && sliced !== balanced) {
+        expandedCandidates.push(sliced);
+      }
+    }
+  }
+
+  let lastParseError = null;
+  for (const candidate of expandedCandidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch (err) {
+      lastParseError = err;
+      // Attempt safe trailing-comma cleanup before giving up on this candidate
+      try {
+        const withoutTrailingCommas = candidate.replace(/,\s*([}\]])/g, '$1');
+        const repaired = JSON.parse(withoutTrailingCommas);
+        if (repaired && typeof repaired === 'object' && !Array.isArray(repaired)) {
+          return repaired;
+        }
+      } catch {
+        // Continue to next candidate
+      }
+    }
+  }
+
+  const errMsg = lastParseError instanceof Error ? lastParseError.message : 'Invalid JSON structure';
+  const parseErr = new Error(`AI returned an invalid JSON response (${errMsg}). Please try again.`);
+  parseErr.code = 'INVALID_JSON_RESPONSE';
+  throw parseErr;
 }
 
 export async function executeGeminiWithFallback(params) {
   const keyPool = getServerGeminiKeyPool();
   if (keyPool.length === 0) {
-    throw new Error('GEMINI_API_KEY is not configured. Please add GEMINI_API_KEY in Vercel Environment Variables (or Secrets) and redeploy.');
+    throw new Error('Server Gemini API key is not configured. Check GEMINI_API_KEY in Settings > Secrets (or Vercel Environment Variables).');
   }
 
   const normalizedPref = FREE_TIER_MODELS.includes(params.preferredModel)
@@ -99,8 +226,13 @@ export async function executeGeminiWithFallback(params) {
         config: params.config,
       });
 
+      const parsedData = params.expectJson
+        ? cleanAndParseGeminiJson(response.text)
+        : null;
+
       return {
         response,
+        parsedData,
         usedModel: model,
         keySlot: keyIndex + 1,
         totalKeySlots: keyPool.length,
@@ -110,114 +242,16 @@ export async function executeGeminiWithFallback(params) {
       lastError = err;
       if (isRetryableQuotaOrServerError(err)) {
         slotCooldowns.set(`${keyIndex}:${model}`, Date.now() + 60_000);
-        if (i < attempts.length - 1) {
-          await sleep(Math.min(400 * (i + 1), 1200));
-          continue;
-        }
+      }
+      if (isFallbackEligibleError(err) && i < attempts.length - 1) {
+        await sleep(Math.min(350 * (i + 1), 1000));
+        continue;
       }
       throw err;
     }
   }
 
-  throw lastError || new Error('All Gemini models and API key slots are currently busy.');
-}
-
-function extractBalancedJsonObject(text) {
-  const startIdx = text.indexOf('{');
-  if (startIdx === -1) return null;
-
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-
-  for (let i = startIdx; i < text.length; i++) {
-    const ch = text[i];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (ch === '\\' && inString) {
-      escaped = true;
-      continue;
-    }
-    if (ch === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (!inString) {
-      if (ch === '{') {
-        depth++;
-      } else if (ch === '}') {
-        depth--;
-        if (depth === 0) {
-          return text.slice(startIdx, i + 1);
-        }
-      }
-    }
-  }
-  return null;
-}
-
-export function cleanAndParseGeminiJson(rawText) {
-  const trimmed = String(rawText || '')
-    .replace(/^\uFEFF/, '')
-    .trim();
-
-  if (!trimmed) {
-    throw new Error('Gemini returned an empty response.');
-  }
-
-  const candidates = [trimmed];
-
-  const fenceRegex = /```(?:json|JSON)?\s*([\s\S]*?)```/g;
-  let match;
-  while ((match = fenceRegex.exec(trimmed)) !== null) {
-    if (match[1]?.trim()) {
-      candidates.push(match[1].trim());
-    }
-  }
-
-  const strippedFence = trimmed
-    .replace(/^```(?:json|JSON)?\s*/i, '')
-    .replace(/\s*```$/i, '')
-    .trim();
-  if (strippedFence && strippedFence !== trimmed) {
-    candidates.push(strippedFence);
-  }
-
-  const expandedCandidates = [];
-  for (const cand of candidates) {
-    expandedCandidates.push(cand);
-    const balanced = extractBalancedJsonObject(cand);
-    if (balanced && balanced !== cand) {
-      expandedCandidates.push(balanced);
-    }
-    const firstBrace = cand.indexOf('{');
-    const lastBrace = cand.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-      const sliced = cand.slice(firstBrace, lastBrace + 1);
-      if (sliced !== cand && sliced !== balanced) {
-        expandedCandidates.push(sliced);
-      }
-    }
-  }
-
-  let lastParseError = null;
-  for (const candidate of expandedCandidates) {
-    try {
-      const parsed = JSON.parse(candidate);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return parsed;
-      }
-    } catch (err) {
-      lastParseError = err;
-    }
-  }
-
-  const errMsg = lastParseError instanceof Error ? lastParseError.message : 'Invalid JSON structure';
-  const parseErr = new Error(`AI returned an invalid JSON response (${errMsg}). Please try again.`);
-  parseErr.code = 'INVALID_JSON_RESPONSE';
-  throw parseErr;
+  throw lastError || new Error('All free-tier Gemini models and server key slots are currently busy.');
 }
 
 export async function parseRequestBody(req) {
@@ -305,7 +339,7 @@ export async function handleGenerateProject(bodyInput) {
       return {
         status: 500,
         payload: {
-          error: 'GEMINI_API_KEY is not configured. Please add GEMINI_API_KEY in Vercel Environment Variables / Secrets.',
+          error: 'Server Gemini API key is not configured. Check GEMINI_API_KEY in Settings > Secrets (or Vercel Environment Variables).',
         },
       };
     }
@@ -350,9 +384,10 @@ Make sure all files contain pristine, production-ready code with gorgeous Tailwi
 CRITICAL: If the user provided a Project Name, it MUST appear as the <title> tag, the top navigation/header brand name, and the "title" attribute.
 CRITICAL: Every generated index.html and fullCode MUST include <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"> and be 100% mobile-responsive, automatically fitting any smartphone or tablet screen seamlessly with zero horizontal scrolling or cut-offs.`;
 
-    const { response, usedModel, fallbackUsed } = await executeGeminiWithFallback({
+    const { parsedData: data, usedModel, fallbackUsed } = await executeGeminiWithFallback({
       preferredModel,
       contents,
+      expectJson: true,
       config: {
         systemInstruction,
         responseMimeType: 'application/json',
@@ -379,12 +414,6 @@ CRITICAL: Every generated index.html and fullCode MUST include <meta name="viewp
       },
     });
 
-    const responseText = response.text;
-    if (!responseText) {
-      throw new Error('No response generated from Gemini AI.');
-    }
-
-    const data = cleanAndParseGeminiJson(responseText);
     if (!Array.isArray(data.files) || data.files.length === 0) {
       if (typeof data.fullCode === 'string' && data.fullCode.trim()) {
         data.files = [{ path: 'index.html', content: data.fullCode }];
@@ -423,7 +452,12 @@ export async function handleRefineProject(bodyInput) {
     }
 
     if (getServerGeminiKeyPool().length === 0) {
-      return { status: 500, payload: { error: 'GEMINI_API_KEY is not configured.' } };
+      return {
+        status: 500,
+        payload: {
+          error: 'Server Gemini API key is not configured. Check GEMINI_API_KEY in Settings > Secrets (or Vercel Environment Variables).',
+        },
+      };
     }
 
     const filesSummary = (Array.isArray(currentFiles) ? currentFiles : [])
@@ -462,9 +496,10 @@ CRITICAL INSTRUCTIONS:
 5. List the paths of all modified or newly created files in "modifiedFiles" (e.g. ["index.html", "style.css"]).
 6. In "fullCode", provide the complete unified standalone HTML document merging index.html, style.css, and script.js with Tailwind CSS CDN, ensuring <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"> is present and it is 100% mobile-friendly with instant sandboxed live preview capability.`;
 
-    const { response, usedModel, fallbackUsed } = await executeGeminiWithFallback({
+    const { parsedData: data, usedModel, fallbackUsed } = await executeGeminiWithFallback({
       preferredModel,
       contents,
+      expectJson: true,
       config: {
         systemInstruction,
         responseMimeType: 'application/json',
@@ -496,12 +531,6 @@ CRITICAL INSTRUCTIONS:
       },
     });
 
-    const responseText = response.text;
-    if (!responseText) {
-      throw new Error('No response generated from Gemini AI.');
-    }
-
-    const data = cleanAndParseGeminiJson(responseText);
     if (!Array.isArray(data.files) || data.files.length === 0) {
       data.files = currentFiles;
     }
