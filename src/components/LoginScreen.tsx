@@ -27,6 +27,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ authError }) => {
         }
       } else if (err?.code === 'auth/popup-closed-by-user') {
         setLocalError('Sign-in popup was closed. Please choose your Google account to continue.');
+      } else if (err?.code === 'auth/unauthorized-domain') {
+        const host = typeof window !== 'undefined' ? window.location.hostname : '';
+        setLocalError(
+          `Domain "${host}" is not authorized for Firebase Google Sign-In yet. Add "${host}" in Firebase Console → Authentication → Settings → Authorized domains.`
+        );
       } else {
         setLocalError(err?.message || 'Google Sign-In failed. Please try again.');
       }
@@ -71,7 +76,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ authError }) => {
         </div>
 
         {displayError && (
-          <div className="w-full mb-4 px-4 py-2.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-300 text-left">
+          <div className="w-full mb-4 px-4 py-2.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-300 text-left break-words">
             {displayError}
           </div>
         )}

@@ -139,6 +139,106 @@ async function executeGeminiWithFallback(params: {
   throw lastError || new Error('All Gemini models and API key slots are currently busy.');
 }
 
+function extractBalancedJsonObject(text: string): string | null {
+  const startIdx = text.indexOf('{');
+  if (startIdx === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          return text.slice(startIdx, i + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function cleanAndParseGeminiJson<T = Record<string, any>>(rawText: string): T {
+  const trimmed = String(rawText || '')
+    .replace(/^\uFEFF/, '')
+    .trim();
+
+  if (!trimmed) {
+    throw new Error('Gemini returned an empty response.');
+  }
+
+  const candidates: string[] = [trimmed];
+
+  // Extract any markdown code fence blocks (```json ... ``` or ``` ... ```)
+  const fenceRegex = /```(?:json|JSON)?\s*([\s\S]*?)```/g;
+  let match: RegExpExecArray | null;
+  while ((match = fenceRegex.exec(trimmed)) !== null) {
+    if (match[1]?.trim()) {
+      candidates.push(match[1].trim());
+    }
+  }
+
+  // Also strip leading/trailing fence markers in case a fence was incomplete
+  const strippedFence = trimmed
+    .replace(/^```(?:json|JSON)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  if (strippedFence && strippedFence !== trimmed) {
+    candidates.push(strippedFence);
+  }
+
+  const expandedCandidates: string[] = [];
+  for (const cand of candidates) {
+    expandedCandidates.push(cand);
+    const balanced = extractBalancedJsonObject(cand);
+    if (balanced && balanced !== cand) {
+      expandedCandidates.push(balanced);
+    }
+    const firstBrace = cand.indexOf('{');
+    const lastBrace = cand.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      const sliced = cand.slice(firstBrace, lastBrace + 1);
+      if (sliced !== cand && sliced !== balanced) {
+        expandedCandidates.push(sliced);
+      }
+    }
+  }
+
+  let lastParseError: unknown = null;
+  for (const candidate of expandedCandidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as T;
+      }
+    } catch (err) {
+      lastParseError = err;
+    }
+  }
+
+  const errMsg = lastParseError instanceof Error ? lastParseError.message : 'Invalid JSON structure';
+  const parseErr: any = new Error(`AI returned an invalid JSON response (${errMsg}). Please try again.`);
+  parseErr.code = 'INVALID_JSON_RESPONSE';
+  throw parseErr;
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '10mb' }));
@@ -261,7 +361,16 @@ CRITICAL: Every generated index.html and fullCode MUST include <meta name="viewp
         throw new Error('No response generated from Gemini AI.');
       }
 
-      const data = JSON.parse(responseText);
+      const data = cleanAndParseGeminiJson<Record<string, any>>(responseText);
+      if (!Array.isArray(data.files) || data.files.length === 0) {
+        if (typeof data.fullCode === 'string' && data.fullCode.trim()) {
+          data.files = [{ path: 'index.html', content: data.fullCode }];
+        } else {
+          throw Object.assign(new Error('AI response is missing generated project files. Please try again.'), {
+            code: 'INVALID_JSON_RESPONSE',
+          });
+        }
+      }
       if (projectName?.trim()) {
         data.title = projectName.trim();
       }
@@ -271,9 +380,10 @@ CRITICAL: Every generated index.html and fullCode MUST include <meta name="viewp
     } catch (error: any) {
       console.error('Generation error:', error);
       const isQuota = isRetryableQuotaOrServerError(error);
-      res.status(isQuota ? 429 : 500).json({
+      const isParseError = error?.code === 'INVALID_JSON_RESPONSE';
+      res.status(isQuota ? 429 : isParseError ? 502 : 500).json({
         error: error.message || 'Failed to generate project',
-        code: isQuota ? 'RATE_LIMITED' : 'GENERATION_ERROR',
+        code: isQuota ? 'RATE_LIMITED' : isParseError ? 'INVALID_JSON_RESPONSE' : 'GENERATION_ERROR',
       });
     }
   });
@@ -365,7 +475,10 @@ CRITICAL INSTRUCTIONS:
         throw new Error('No response generated from Gemini AI.');
       }
 
-      const data = JSON.parse(responseText);
+      const data = cleanAndParseGeminiJson<Record<string, any>>(responseText);
+      if (!Array.isArray(data.files) || data.files.length === 0) {
+        data.files = currentFiles;
+      }
       if (projectTitle && !prompt.toLowerCase().includes('rename') && !prompt.toLowerCase().includes('change title')) {
         data.title = projectTitle;
       }
@@ -375,9 +488,10 @@ CRITICAL INSTRUCTIONS:
     } catch (error: any) {
       console.error('Refinement error:', error);
       const isQuota = isRetryableQuotaOrServerError(error);
-      res.status(isQuota ? 429 : 500).json({
+      const isParseError = error?.code === 'INVALID_JSON_RESPONSE';
+      res.status(isQuota ? 429 : isParseError ? 502 : 500).json({
         error: error.message || 'Failed to refine project',
-        code: isQuota ? 'RATE_LIMITED' : 'REFINEMENT_ERROR',
+        code: isQuota ? 'RATE_LIMITED' : isParseError ? 'INVALID_JSON_RESPONSE' : 'REFINEMENT_ERROR',
       });
     }
   });

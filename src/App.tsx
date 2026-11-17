@@ -27,6 +27,7 @@ import { ExportModal } from './components/ExportModal';
 import { AdminDashboard } from './components/AdminDashboard';
 import { LiveSiteViewer } from './components/LiveSiteViewer';
 import { createCleanSlug } from './utils/slugHelper';
+import { safeParseFetchJson } from './utils/jsonHelper';
 
 function sanitizeId(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128) || 'proj_' + Date.now();
@@ -444,18 +445,18 @@ export default function App() {
             preferredModel: modelOverride || selectedModel,
           }),
         });
-        const payload = await res.json();
+        const payload = await safeParseFetchJson<Record<string, any>>(res);
         return { res, payload };
       };
 
       let { res, payload: data } = await attemptRequest();
-      if (!res.ok && (res.status === 429 || res.status === 503 || data?.code === 'RATE_LIMITED')) {
+      if (!res.ok && (res.status === 429 || res.status === 503 || res.status === 502 || data?.code === 'RATE_LIMITED' || data?.code === 'INVALID_JSON_RESPONSE')) {
         // Automatic client fallback retry with Lite model
         const fallbackRes = await attemptRequest('gemini-3.1-flash-lite');
         res = fallbackRes.res;
         data = fallbackRes.payload;
         if (res.ok) {
-          setLastFallbackNotice(`Auto-switched to ${data.usedModel || 'gemini-3.1-flash-lite'} on rate limit.`);
+          setLastFallbackNotice(`Auto-switched to ${data.usedModel || 'gemini-3.1-flash-lite'}.`);
         }
       }
 
@@ -516,17 +517,17 @@ export default function App() {
             preferredModel: modelOverride || selectedModel,
           }),
         });
-        const payload = await res.json();
+        const payload = await safeParseFetchJson<Record<string, any>>(res);
         return { res, payload };
       };
 
       let { res, payload: data } = await attemptRefine();
-      if (!res.ok && (res.status === 429 || res.status === 503 || data?.code === 'RATE_LIMITED')) {
+      if (!res.ok && (res.status === 429 || res.status === 503 || res.status === 502 || data?.code === 'RATE_LIMITED' || data?.code === 'INVALID_JSON_RESPONSE')) {
         const fallbackRes = await attemptRefine('gemini-3.1-flash-lite');
         res = fallbackRes.res;
         data = fallbackRes.payload;
         if (res.ok) {
-          setLastFallbackNotice(`Auto-switched to ${data.usedModel || 'gemini-3.1-flash-lite'} on rate limit.`);
+          setLastFallbackNotice(`Auto-switched to ${data.usedModel || 'gemini-3.1-flash-lite'}.`);
         }
       }
 

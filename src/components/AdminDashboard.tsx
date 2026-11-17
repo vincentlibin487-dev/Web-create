@@ -7,6 +7,7 @@ import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/aut
 import { collection, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from '../firebase';
 import { PublishedSite } from '../types';
+import { safeParseFetchJson } from '../utils/jsonHelper';
 
 interface AdminUserRecord {
   uid: string;
@@ -147,7 +148,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onOpenLiveSite }
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password: passwordInput }),
       });
-      const data = await res.json();
+      const data = await safeParseFetchJson<{ ok?: boolean; error?: string }>(res);
       if (!res.ok || !data.ok) {
         setPasswordError(data.error || 'Incorrect admin password. Please try again.');
         return;
