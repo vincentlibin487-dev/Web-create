@@ -29,7 +29,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <span className="font-bold text-base tracking-tight text-white">Google AI Studio</span>
+              <span className="font-bold text-base tracking-tight text-white">Build Studio</span>
               <span className="text-[10px] font-bold uppercase tracking-wider bg-blue-500/20 text-blue-300 border border-blue-500/30 px-2 py-0.5 rounded-full">Web Builder</span>
             </div>
             <p className="text-xs text-[#9aa0a6] truncate max-w-[200px] sm:max-w-xs">{currentProject.title}</p>

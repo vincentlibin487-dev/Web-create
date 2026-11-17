@@ -1,4 +1,5 @@
 import express from 'express';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import { GoogleGenAI, Type } from '@google/genai';
@@ -7,55 +8,228 @@ import { createServer as createViteServer } from 'vite';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isProduction = process.env.NODE_ENV === 'production';
 
+interface ProjectFile {
+  path: string;
+  content: string;
+}
+
+const FREE_TIER_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
+
+function getServerGeminiKeyPool(): string[] {
+  const candidates = [
+    process.env.GEMINI_API_KEY || '',
+    ...(process.env.GEMINI_API_KEYS || '').split(','),
+    process.env.GEMINI_API_KEY_2 || '',
+    process.env.GEMINI_API_KEY_3 || '',
+    process.env.GEMINI_API_KEY_4 || '',
+    process.env.GEMINI_API_KEY_5 || '',
+    process.env.GEMINI_API_KEY_6 || '',
+  ]
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0 && !k.startsWith('MY_'));
+
+  return Array.from(new Set(candidates));
+}
+
+const slotCooldowns = new Map<string, number>();
+
+function isRetryableQuotaOrServerError(err: any): boolean {
+  const status = err?.status || err?.code;
+  const msg = String(err?.message || err || '').toLowerCase();
+  return (
+    status === 429 ||
+    status === 503 ||
+    msg.includes('429') ||
+    msg.includes('503') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('quota') ||
+    msg.includes('rate limit') ||
+    msg.includes('unavailable') ||
+    msg.includes('overloaded') ||
+    msg.includes('high demand')
+  );
+}
+
+async function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function executeGeminiWithFallback(params: {
+  preferredModel?: string;
+  contents: any;
+  config: any;
+}) {
+  const keyPool = getServerGeminiKeyPool();
+  if (keyPool.length === 0) {
+    throw new Error('GEMINI_API_KEY is not configured. Please set your API key in Settings > Secrets.');
+  }
+
+  const normalizedPref = FREE_TIER_MODELS.includes(params.preferredModel as any)
+    ? (params.preferredModel as string)
+    : FREE_TIER_MODELS[0];
+
+  const modelQueue = [
+    normalizedPref,
+    ...FREE_TIER_MODELS.filter((m) => m !== normalizedPref),
+  ];
+
+  const now = Date.now();
+  const attempts: { keyIndex: number; model: string }[] = [];
+
+  for (const model of modelQueue) {
+    for (let keyIndex = 0; keyIndex < keyPool.length; keyIndex++) {
+      const slotKey = `${keyIndex}:${model}`;
+      const cooldownUntil = slotCooldowns.get(slotKey) || 0;
+      if (cooldownUntil > now) {
+        continue;
+      }
+      attempts.push({ keyIndex, model });
+    }
+  }
+
+  // If every slot is temporarily on cooldown, try all combinations as a last resort
+  if (attempts.length === 0) {
+    for (const model of modelQueue) {
+      for (let keyIndex = 0; keyIndex < keyPool.length; keyIndex++) {
+        attempts.push({ keyIndex, model });
+      }
+    }
+  }
+
+  let lastError: any = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const { keyIndex, model } = attempts[i];
+    const apiKey = keyPool[keyIndex];
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: params.contents,
+        config: params.config,
+      });
+
+      return {
+        response,
+        usedModel: model,
+        keySlot: keyIndex + 1,
+        totalKeySlots: keyPool.length,
+        fallbackUsed: i > 0,
+      };
+    } catch (err: any) {
+      lastError = err;
+      if (isRetryableQuotaOrServerError(err)) {
+        slotCooldowns.set(`${keyIndex}:${model}`, Date.now() + 60_000);
+        if (i < attempts.length - 1) {
+          await sleep(Math.min(400 * (i + 1), 1200));
+          continue;
+        }
+      }
+      throw err;
+    }
+  }
+
+  throw lastError || new Error('All Gemini models and API key slots are currently busy.');
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '10mb' }));
 
-  // Initialize Gemini AI client server-side
-  const ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY || '',
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
+  const ADMIN_PASSCODE_HASH = 'd6cfc211cfcbe6da718b48a62b60450f81651c633df4c4dbf3c10755ef09f082';
+
+  // API Route: Verify Admin Panel Password (timing-safe comparison)
+  app.post('/api/admin/verify', (req, res) => {
+    try {
+      const password = typeof req.body?.password === 'string' ? req.body.password : '';
+      if (!password) {
+        return res.status(400).json({ ok: false, error: 'Password is required' });
       }
+
+      const expectedHash = process.env.ADMIN_PASSWORD
+        ? crypto.createHash('sha256').update(process.env.ADMIN_PASSWORD).digest('hex')
+        : ADMIN_PASSCODE_HASH;
+
+      const providedHash = crypto.createHash('sha256').update(password).digest('hex');
+      const isValid = crypto.timingSafeEqual(
+        Buffer.from(providedHash, 'hex'),
+        Buffer.from(expectedHash, 'hex')
+      );
+
+      if (!isValid) {
+        return res.status(401).json({ ok: false, error: 'Invalid admin password' });
+      }
+
+      return res.json({ ok: true });
+    } catch {
+      return res.status(500).json({ ok: false, error: 'Verification failed' });
     }
   });
 
-  // API Route: Generate website/app from prompt
+  // API Route: Generate multi-file project from prompt
   app.post('/api/generate', async (req, res) => {
     try {
-      const { prompt } = req.body;
+      const { prompt, attachment, projectName, preferredModel } = req.body;
       if (!prompt) {
         return res.status(400).json({ error: 'Prompt is required' });
       }
 
-      if (!process.env.GEMINI_API_KEY) {
+      if (getServerGeminiKeyPool().length === 0) {
         return res.status(500).json({ 
-          error: 'GEMINI_API_KEY is not configured. Please set your API key in the Settings > Secrets panel.' 
+          error: 'GEMINI_API_KEY is not configured. Please set your API key in Settings > Secrets.' 
         });
       }
 
-      const systemInstruction = `You are an elite frontend architect and expert full-stack web developer. 
-Your task is to create a complete, stunning, fully functional, responsive single-page web application or website based on the user's prompt.
-The output MUST be a JSON object with the following structure:
+      const nameDirective = projectName?.trim() 
+        ? `\nIMPORTANT: The user has specified the exact Project Name: "${projectName.trim()}". You MUST use "${projectName.trim()}" as the exact <title> in index.html, prominently as the main header/brand logo text in the navigation bar/hero of the website, in the package.json "name", and as the "title" in the JSON response.`
+        : '';
+
+      let promptText = `Create a complete multi-file web project for this idea: ${prompt}.${nameDirective}`;
+      let contents: any = promptText;
+      if (attachment) {
+        contents = {
+          parts: [
+            { text: promptText },
+            {
+              inlineData: {
+                mimeType: 'image/png',
+                data: attachment.replace(/^data:image\/[a-z]+;base64,/, '')
+              }
+            }
+          ]
+        };
+      }
+
+      const systemInstruction = `You are an elite full-stack software architect.
+Your task is to create a complete, production-grade, multi-file web application based on the user's prompt.
+You must return a JSON object containing a list of separate files and a standalone preview bundle:
 {
-  "title": "Short catchy title for the app",
+  "title": "Short catchy app title (use exact user specified Project Name if provided)",
   "description": "One sentence description",
-  "html": "The clean HTML structure (inside <body> without outer html/head wrapper, using Tailwind CSS classes)",
-  "css": "Any custom CSS styles needed beyond Tailwind",
-  "js": "Clean Vanilla JavaScript code for full interactivity, state management, event listeners, etc.",
-  "fullCode": "A complete, self-contained standalone HTML document string containing <!DOCTYPE html>, Tailwind CSS CDN (<script src='https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4'></script>), Lucide icons CDN if needed, custom CSS, and script tags so the app runs instantly in a sandbox."
+  "files": [
+    { "path": "index.html", "content": "Complete HTML markup referencing style.css and script.js, plus Tailwind CSS CDN" },
+    { "path": "style.css", "content": "Custom CSS styles" },
+    { "path": "script.js", "content": "Vanilla JavaScript interactive logic" },
+    { "path": "package.json", "content": "Standard npm package.json with dependencies" },
+    { "path": "README.md", "content": "Project documentation and setup instructions" }
+  ],
+  "fullCode": "A self-contained single HTML document combining index.html, style.css, and script.js so it can be previewed instantly in a sandbox iframe."
 }
 
-Guidelines for the code:
-1. Make it visually breathtaking with modern Tailwind styling (gradients, card shadows, rounded-2xl, glassmorphism, smooth hover states, dark/light compatibility).
-2. Ensure full interactivity: forms work, modals open/close, tabs switch, state updates, counters increment/decrement, charts or lists populate with realistic sample data.
-3. Include helpful placeholder data and empty states so the app looks alive and professional immediately upon loading.
-4. Keep the HTML, CSS, and JS clean, robust, and error-free.`;
+Make sure all files contain pristine, production-ready code with gorgeous Tailwind styling and full interactivity.
+CRITICAL: If the user provided a Project Name, it MUST appear as the <title> tag, the top navigation/header brand name, and the "title" attribute.
+CRITICAL: Every generated index.html and fullCode MUST include <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"> and be 100% mobile-responsive, automatically fitting any smartphone or tablet screen seamlessly with zero horizontal scrolling or cut-offs.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Create a complete web application or website for this idea: ${prompt}`,
+      const { response, usedModel, fallbackUsed } = await executeGeminiWithFallback({
+        preferredModel,
+        contents,
         config: {
           systemInstruction,
           responseMimeType: 'application/json',
@@ -64,12 +238,20 @@ Guidelines for the code:
             properties: {
               title: { type: Type.STRING },
               description: { type: Type.STRING },
-              html: { type: Type.STRING },
-              css: { type: Type.STRING },
-              js: { type: Type.STRING },
+              files: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    path: { type: Type.STRING },
+                    content: { type: Type.STRING }
+                  },
+                  required: ['path', 'content']
+                }
+              },
               fullCode: { type: Type.STRING }
             },
-            required: ['title', 'description', 'html', 'css', 'js', 'fullCode']
+            required: ['title', 'description', 'files', 'fullCode']
           }
         }
       });
@@ -80,54 +262,73 @@ Guidelines for the code:
       }
 
       const data = JSON.parse(responseText);
+      if (projectName?.trim()) {
+        data.title = projectName.trim();
+      }
+      data.usedModel = usedModel;
+      data.fallbackUsed = fallbackUsed;
       res.json(data);
     } catch (error: any) {
       console.error('Generation error:', error);
-      res.status(500).json({ error: error.message || 'Failed to generate website' });
+      const isQuota = isRetryableQuotaOrServerError(error);
+      res.status(isQuota ? 429 : 500).json({
+        error: error.message || 'Failed to generate project',
+        code: isQuota ? 'RATE_LIMITED' : 'GENERATION_ERROR',
+      });
     }
   });
 
-  // API Route: Refine / Iterate on existing website with chat prompt
+  // API Route: Refine multi-file project with live edit assistant
   app.post('/api/refine', async (req, res) => {
     try {
-      const { prompt, currentCode, conversationHistory } = req.body;
-      if (!prompt || !currentCode) {
-        return res.status(400).json({ error: 'Prompt and currentCode are required' });
+      const { prompt, attachment, currentFiles, projectTitle, preferredModel } = req.body;
+      if (!prompt || !currentFiles) {
+        return res.status(400).json({ error: 'Prompt and currentFiles are required' });
       }
 
-      if (!process.env.GEMINI_API_KEY) {
-        return res.status(500).json({ 
-          error: 'GEMINI_API_KEY is not configured.' 
-        });
+      if (getServerGeminiKeyPool().length === 0) {
+        return res.status(500).json({ error: 'GEMINI_API_KEY is not configured.' });
       }
 
-      const systemInstruction = `You are an expert full-stack web developer assisting a user in refining their web application.
-You are given the current code and the user's new request/feedback.
-Modify and improve the code accordingly.
-Return a JSON object with updated:
-{
-  "title": "Title",
-  "description": "Description",
-  "html": "Updated HTML",
-  "css": "Updated CSS",
-  "js": "Updated JS",
-  "fullCode": "Updated complete standalone HTML document"
-}`;
+      const filesSummary = (currentFiles as ProjectFile[])
+        .map(f => `=== FILE: ${f.path} ===\n${f.content}`)
+        .join('\n\n');
 
-      const chatContent = `Current App HTML:
-${currentCode.html || ''}
+      let promptText = `Refine and edit this project according to this instruction: ${prompt}`;
+      let contents: any = promptText;
+      if (attachment) {
+        contents = {
+          parts: [
+            { text: promptText },
+            {
+              inlineData: {
+                mimeType: 'image/png',
+                data: attachment.replace(/^data:image\/[a-z]+;base64,/, '')
+              }
+            }
+          ]
+        };
+      }
 
-Current App CSS:
-${currentCode.css || ''}
+      const systemInstruction = `You are an expert full-stack developer and UI/UX designer assisting a user with editing and enhancing their existing multi-file web project in real-time.
 
-Current App JS:
-${currentCode.js || ''}
+Existing project title: "${projectTitle || 'Web Application'}"
+Here are the current project files:
+${filesSummary}
 
-User Request for Refinement: ${prompt}`;
+User Request for Live Edit: "${prompt}"
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: chatContent,
+CRITICAL INSTRUCTIONS:
+1. DO NOT discard or recreate the project from scratch!
+2. Surgically apply the requested modifications (e.g. changing styles, updating buttons, adding interactive components, modifying layouts, adding sections, changing colors) to the existing files while preserving the overall design aesthetic, functionality, and unchanged files.
+3. Keep the exact project title unless the user explicitly requested a title change.
+4. Explain clearly in "explanation" what specific changes you performed in 2-3 friendly bullet points.
+5. List the paths of all modified or newly created files in "modifiedFiles" (e.g. ["index.html", "style.css"]).
+6. In "fullCode", provide the complete unified standalone HTML document merging index.html, style.css, and script.js with Tailwind CSS CDN, ensuring <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"> is present and it is 100% mobile-friendly with instant sandboxed live preview capability.`;
+
+      const { response, usedModel, fallbackUsed } = await executeGeminiWithFallback({
+        preferredModel,
+        contents,
         config: {
           systemInstruction,
           responseMimeType: 'application/json',
@@ -136,12 +337,25 @@ User Request for Refinement: ${prompt}`;
             properties: {
               title: { type: Type.STRING },
               description: { type: Type.STRING },
-              html: { type: Type.STRING },
-              css: { type: Type.STRING },
-              js: { type: Type.STRING },
+              explanation: { type: Type.STRING },
+              modifiedFiles: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
+              },
+              files: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    path: { type: Type.STRING },
+                    content: { type: Type.STRING }
+                  },
+                  required: ['path', 'content']
+                }
+              },
               fullCode: { type: Type.STRING }
             },
-            required: ['title', 'description', 'html', 'css', 'js', 'fullCode']
+            required: ['title', 'description', 'explanation', 'modifiedFiles', 'files', 'fullCode']
           }
         }
       });
@@ -152,10 +366,19 @@ User Request for Refinement: ${prompt}`;
       }
 
       const data = JSON.parse(responseText);
+      if (projectTitle && !prompt.toLowerCase().includes('rename') && !prompt.toLowerCase().includes('change title')) {
+        data.title = projectTitle;
+      }
+      data.usedModel = usedModel;
+      data.fallbackUsed = fallbackUsed;
       res.json(data);
     } catch (error: any) {
       console.error('Refinement error:', error);
-      res.status(500).json({ error: error.message || 'Failed to refine website' });
+      const isQuota = isRetryableQuotaOrServerError(error);
+      res.status(isQuota ? 429 : 500).json({
+        error: error.message || 'Failed to refine project',
+        code: isQuota ? 'RATE_LIMITED' : 'REFINEMENT_ERROR',
+      });
     }
   });
 

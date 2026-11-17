@@ -1,0 +1,103 @@
+/**
+ * Phase 0: Security Rules Verification Suite (Dirty Dozen Attack Payloads)
+ * Reference specification for @firebase/rules-unit-testing against firestore.rules.
+ */
+
+export const DIRTY_DOZEN_PAYLOADS = [
+  {
+    name: '1. Unauthenticated Write',
+    auth: null,
+    path: '/users/user1/projects/proj_1',
+    operation: 'create',
+    payload: { id: 'proj_1', ownerId: 'user1', title: 'Test' },
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '2. Unverified Email Spoof as Admin',
+    auth: { uid: 'attacker', email: 'amalj7767@gmail.com', email_verified: false },
+    path: '/users/user1',
+    operation: 'get',
+    payload: null,
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '3. Cross-User Project Access',
+    auth: { uid: 'user2', email: 'u2@gmail.com', email_verified: true },
+    path: '/users/user1/projects/proj_1',
+    operation: 'get',
+    payload: null,
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '4. Cross-User PII & Published List Scraping',
+    auth: { uid: 'user2', email: 'u2@gmail.com', email_verified: true },
+    path: '/published_sites',
+    operation: 'list',
+    payload: null,
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '5. Identity Spoofing in Published Site ownerId',
+    auth: { uid: 'user1', email: 'u1@gmail.com', email_verified: true },
+    path: '/published_sites/site_1',
+    operation: 'create',
+    payload: { siteId: 'site_1', projectId: 'proj_1', ownerId: 'user2', title: 'Spoofed', fullCode: '<html></html>', version: 1 },
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '6. Shadow Ghost Field Injection',
+    auth: { uid: 'user1', email: 'u1@gmail.com', email_verified: true },
+    path: '/users/user1',
+    operation: 'create',
+    payload: { uid: 'user1', name: 'U1', email: 'u1@gmail.com', appsCount: 0, isAdmin: true },
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '7. Path Variable ID Poisoning',
+    auth: { uid: 'user1', email: 'u1@gmail.com', email_verified: true },
+    path: '/published_sites/bad$id$with$chars',
+    operation: 'create',
+    payload: { siteId: 'bad$id$with$chars', projectId: 'proj_1', ownerId: 'user1', title: 'Bad ID', fullCode: '<html></html>', version: 1 },
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '8. Immutable Published Site projectId Mutation',
+    auth: { uid: 'user1', email: 'u1@gmail.com', email_verified: true },
+    path: '/published_sites/site_1',
+    operation: 'update',
+    payload: { projectId: 'proj_other', version: 2 },
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '9. Client Timestamp Forgery',
+    auth: { uid: 'user1', email: 'u1@gmail.com', email_verified: true },
+    path: '/published_sites/site_1',
+    operation: 'update',
+    payload: { updatedAt: new Date('2020-01-01T00:00:00Z'), version: 2 },
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '10. Array Exhaustion / Non-Map File Entry',
+    auth: { uid: 'user1', email: 'u1@gmail.com', email_verified: true },
+    path: '/users/user1/projects/proj_1',
+    operation: 'create',
+    payload: { id: 'proj_1', ownerId: 'user1', title: 'Bad Files', files: ['not-a-map'] },
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '11. Oversized String Denial of Wallet',
+    auth: { uid: 'user1', email: 'u1@gmail.com', email_verified: true },
+    path: '/published_sites/site_1',
+    operation: 'create',
+    payload: { siteId: 'site_1', projectId: 'proj_1', ownerId: 'user1', title: 'A'.repeat(200), fullCode: '<html></html>', version: 1 },
+    expected: 'PERMISSION_DENIED',
+  },
+  {
+    name: '12. Privilege Escalation to Daily Stats List',
+    auth: { uid: 'user1', email: 'u1@gmail.com', email_verified: true },
+    path: '/daily_stats',
+    operation: 'list',
+    payload: null,
+    expected: 'PERMISSION_DENIED',
+  },
+];
