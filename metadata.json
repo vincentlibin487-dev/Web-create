@@ -1,0 +1,6 @@
+{
+  "name": "NexusAI - AI Website & App Builder",
+  "description": "Create, preview, iterate, and export full-stack web applications and websites instantly using Gemini AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
